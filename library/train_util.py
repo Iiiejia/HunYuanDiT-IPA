@@ -134,7 +134,11 @@ IMAGE_TRANSFORMS = transforms.Compose(
         transforms.Normalize([0.5], [0.5]),
     ]
 )
-
+IP_IMAGE_TRANSFORMS = transforms.Compose([
+    transforms.Resize([224, 224]),  # 先将图片缩放至256
+    transforms.ToTensor(),  # 转换为Tensor
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # 标准化
+])
 TEXT_ENCODER_OUTPUTS_CACHE_SUFFIX = "_te_outputs.npz"
 
 
@@ -641,6 +645,7 @@ class BaseDataset(torch.utils.data.Dataset):
         self.aug_helper = AugHelper()
 
         self.image_transforms = IMAGE_TRANSFORMS
+        self.ip_image_transforms = IP_IMAGE_TRANSFORMS
 
         self.image_data: Dict[str, ImageInfo] = {}
         self.image_to_subset: Dict[str, Union[DreamBoothSubset, FineTuningSubset]] = {}
@@ -1208,6 +1213,7 @@ class BaseDataset(torch.utils.data.Dataset):
         text_encoder_outputs1_list = []
         text_encoder_outputs2_list = []
         text_encoder_pool2_list = []
+        ip_images = []
 
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
             image_info = self.image_data[image_key]
@@ -1300,8 +1306,10 @@ class BaseDataset(torch.utils.data.Dataset):
                 latents = None
                 image = self.image_transforms(img)  # -1.0~1.0のtorch.Tensorになる
                 del img
-
+            img = Image.open(image_info.absolute_path).convert("RGB")
+            ip_image = self.ip_image_transforms(img)
             images.append(image)
+            ip_images.append(ip_image)
             latents_list.append(latents)
             alpha_mask_list.append(alpha_mask)
 
@@ -1412,6 +1420,7 @@ class BaseDataset(torch.utils.data.Dataset):
         else:
             images = None
         example["images"] = images
+        example["ip_images"] = ip_images
 
         example["latents"] = torch.stack(latents_list) if latents_list[0] is not None else None
         example["captions"] = captions

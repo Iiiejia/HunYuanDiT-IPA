@@ -468,6 +468,8 @@ class CrossAttention(nn.Module):
         super().__init__()
         self.qdim = qdim
         self.kdim = kdim
+        self.qkv_bias = qkv_bias
+        self.qk_norm = qk_norm
         self.num_heads = num_heads
         assert self.qdim % num_heads == 0, "self.qdim must be divisible by num_heads"
         self.head_dim = self.qdim // num_heads
