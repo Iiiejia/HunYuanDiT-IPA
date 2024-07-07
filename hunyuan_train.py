@@ -21,7 +21,7 @@ from diffusers import DDPMScheduler
 from library import deepspeed_utils, sdxl_model_util
 
 import library.train_util as train_util
-
+from library.ipa.model import IPAModel
 from library.utils import setup_logging, add_logging_arguments
 
 setup_logging()
@@ -230,7 +230,7 @@ def train(args):
     # Prepare for learning: Get the model into a proper state
     if args.gradient_checkpointing:
         hydit.enable_gradient_checkpointing()
-    train_hydit = args.learning_rate != 0
+    train_hydit = args.learning_rate != 0 and not args.train_ip_adapter
     train_text_encoder1 = False
     train_text_encoder2 = False
 
@@ -269,20 +269,27 @@ def train(args):
     hydit.requires_grad_(train_hydit)
     if not train_hydit:
         hydit.to(accelerator.device, dtype=weight_dtype)  # because of hydit is not prepared
-
+    if args.train_ip_adapter:
+        ipa_model = IPAModel(hydit.blocks, accelerator.device, weight_dtype)
+        ipa_model.set_requires_grad(True)
+    else:
+        ipa_model = None
     training_models = []
     params_to_optimize = []
+    
     if train_hydit:
         training_models.append(hydit)
         if block_lrs is None:
             params_to_optimize.append({"params": list(filter(lambda p: p.requires_grad, hydit.parameters())), "lr": args.learning_rate})
         else:
             raise NotImplementedError("block_lr is not supported yet for HunyuanDiT")
-
-    if train_text_encoder1:
+    if args.train_ip_adapter:
+        training_models.extend([module for module in ipa_model.all_module_need_to_train_list()])
+        params_to_optimize.append({"params": list(filter(lambda p: p.requires_grad, ipa_model.get_trainable_param())), "lr": args.learning_rate})
+    if train_text_encoder1 and not args.train_ip_adapter:
         training_models.append(text_encoder1)
         params_to_optimize.append({"params": list(filter(lambda p: p.requires_grad, text_encoder1.parameters())), "lr": args.learning_rate_te1 or args.learning_rate})
-    if train_text_encoder2:
+    if train_text_encoder2 and not args.train_ip_adapter:
         training_models.append(text_encoder2)
         params_to_optimize.append({"params": list(filter(lambda p: p.requires_grad, text_encoder2.parameters())), "lr": args.learning_rate_te2 or args.learning_rate})
 
@@ -292,7 +299,7 @@ def train(args):
         for p in group["params"]:
             n_params += p.numel()
 
-    accelerator.print(f"train hydit: {train_hydit}, text_encoder1: {train_text_encoder1}, text_encoder2: {train_text_encoder2}")
+    accelerator.print(f"train hydit: {train_hydit}, text_encoder1: {train_text_encoder1 and not args.train_ip_adapter}, text_encoder2: {train_text_encoder2 and not args.train_ip_adapter}")
     accelerator.print(f"number of models: {len(training_models)}")
     accelerator.print(f"number of trainable parameters: {n_params}")
 
@@ -400,8 +407,8 @@ def train(args):
         ds_model = deepspeed_utils.prepare_deepspeed_model(
             args,
             hydit=hydit if train_hydit else None,
-            text_encoder1=text_encoder1 if train_text_encoder1 else None,
-            text_encoder2=text_encoder2 if train_text_encoder2 else None,
+            text_encoder1=text_encoder1 if train_text_encoder1 and not args.train_ip_adapter else None,
+            text_encoder2=text_encoder2 if train_text_encoder2 and not args.train_ip_adapter else None,
         )
         # most of ZeRO stage uses optimizer partitioning, so we have to prepare optimizer and ds_model at the same time. # pull/1139#issuecomment-1986790007
         ds_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -413,10 +420,15 @@ def train(args):
         # acceleratorがなんかよろしくやってくれるらしい
         if train_hydit:
             hydit = accelerator.prepare(hydit)
-        if train_text_encoder1:
+        if train_text_encoder1 and not args.train_ip_adapter:
             text_encoder1 = accelerator.prepare(text_encoder1)
-        if train_text_encoder2:
+        if train_text_encoder2 and not args.train_ip_adapter:
             text_encoder2 = accelerator.prepare(text_encoder2)
+        if args.train_ip_adapter:
+            ipa_model.image_proj_model = accelerator.prepare(ipa_model.image_proj_model)
+            for modules in ipa_model.ip_cross_attn_module_list:
+                modules[0] = accelerator.prepare(modules[0])
+                modules[1] = accelerator.prepare(modules[1])
         optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
 
     # TextEncoderの出力をキャッシュするときにはCPUへ移動する
@@ -570,7 +582,7 @@ def train(args):
                 if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
                     input_ids1 = batch["input_ids"]
                     input_ids2 = batch["input_ids2"]
-                    with torch.set_grad_enabled(args.train_text_encoder):
+                    with torch.set_grad_enabled(args.train_text_encoder and not args.train_ip_adapter):
                         input_ids1 = input_ids1.to(accelerator.device)
                         input_ids2 = input_ids2.to(accelerator.device)
                         encoder_hidden_states1, mask1, encoder_hidden_states2, mask2 = (
@@ -590,7 +602,9 @@ def train(args):
                     logger.debug("encoder_hidden_states2", encoder_hidden_states2.shape)
                 else:
                     raise NotImplementedError
-
+                if args.train_ip_adapter:
+                    ip_tensor = batch["ip_images"]
+                    ipa_model.set_ip_emb_with_image_tensor(ip_tensor)
                 # Sample noise, sample a random timestep for each image, and add noise to the latents,
                 # with noise offset and/or multires noise if specified
                 noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
@@ -672,6 +686,7 @@ def train(args):
                     )
 
                 accelerator.backward(loss)
+                ipa_model.clear_ip_emb()
 
                 if not (args.fused_backward_pass or args.fused_optimizer_groups):
                     if accelerator.sync_gradients and args.max_grad_norm != 0.0:
@@ -711,26 +726,30 @@ def train(args):
                 if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
-                        src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
-                        hunyuan_utils.save_hydit_model_on_epoch_end_or_stepwise(
-                            args,
-                            False,
-                            accelerator,
-                            src_path,
-                            save_stable_diffusion_format,
-                            use_safetensors,
-                            save_dtype,
-                            epoch,
-                            num_train_epochs,
-                            global_step,
-                            accelerator.unwrap_model(text_encoder1),
-                            accelerator.unwrap_model(text_encoder2),
-                            accelerator.unwrap_model(hydit),
-                            vae,
-                            logit_scale,
-                            ckpt_info,
-                            hydit_version,
-                        )
+                        if not args.train_ip_adapter:
+                            src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
+                            hunyuan_utils.save_hydit_model_on_epoch_end_or_stepwise(
+                                args,
+                                False,
+                                accelerator,
+                                src_path,
+                                save_stable_diffusion_format,
+                                use_safetensors,
+                                save_dtype,
+                                epoch,
+                                num_train_epochs,
+                                global_step,
+                                accelerator.unwrap_model(text_encoder1),
+                                accelerator.unwrap_model(text_encoder2),
+                                accelerator.unwrap_model(hydit),
+                                vae,
+                                logit_scale,
+                                ckpt_info,
+                                hydit_version,
+                            )
+                        else:
+                            os.makedirs(os.path.join(args.ip_adapter_state_path, f"global_step_{global_step}"), exist_ok=True)
+                            ipa_model.save_state_dict_to_folder(os.path.join(args.ip_adapter_state_path, f"global_step_{global_step}"), acc_wrapped=False)
 
             current_loss = loss.detach().item()  # 平均なのでbatch sizeは関係ないはず
             if args.logging_dir is not None:
@@ -757,27 +776,32 @@ def train(args):
         accelerator.wait_for_everyone()
 
         if args.save_every_n_epochs is not None:
+            
             if accelerator.is_main_process:
-                src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
-                hunyuan_utils.save_hydit_model_on_epoch_end_or_stepwise(
-                    args,
-                    True,
-                    accelerator,
-                    src_path,
-                    save_stable_diffusion_format,
-                    use_safetensors,
-                    save_dtype,
-                    epoch,
-                    num_train_epochs,
-                    global_step,
-                    accelerator.unwrap_model(text_encoder1),
-                    accelerator.unwrap_model(text_encoder2),
-                    accelerator.unwrap_model(hydit),
-                    vae,
-                    logit_scale,
-                    ckpt_info,
-                    hydit_version,
-                )
+                if not args.train_ip_adapter:
+                    src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
+                    hunyuan_utils.save_hydit_model_on_epoch_end_or_stepwise(
+                        args,
+                        True,
+                        accelerator,
+                        src_path,
+                        save_stable_diffusion_format,
+                        use_safetensors,
+                        save_dtype,
+                        epoch,
+                        num_train_epochs,
+                        global_step,
+                        accelerator.unwrap_model(text_encoder1),
+                        accelerator.unwrap_model(text_encoder2),
+                        accelerator.unwrap_model(hydit),
+                        vae,
+                        logit_scale,
+                        ckpt_info,
+                        hydit_version,
+                    )
+                else:
+                    os.makedirs(os.path.join(args.ip_adapter_state_path, f"epoch_{epoch}"), exist_ok=True)
+                    ipa_model.save_state_dict_to_folder(os.path.join(args.ip_adapter_state_path, f"epoch_{epoch}"), acc_wrapped=False)
 
         sdxl_train_util.sample_images(
             accelerator,
@@ -805,23 +829,27 @@ def train(args):
     del accelerator  # この後メモリを使うのでこれは消す
 
     if is_main_process:
-        src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
-        hunyuan_utils.save_hydit_model_on_train_end(
-            args,
-            src_path,
-            save_stable_diffusion_format,
-            use_safetensors,
-            save_dtype,
-            epoch,
-            global_step,
-            text_encoder1,
-            text_encoder2,
-            hydit,
-            vae,
-            logit_scale,
-            ckpt_info,
-            hydit_version,
-        )
+        if not args.train_ip_adapter:
+            src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
+            hunyuan_utils.save_hydit_model_on_train_end(
+                args,
+                src_path,
+                save_stable_diffusion_format,
+                use_safetensors,
+                save_dtype,
+                epoch,
+                global_step,
+                text_encoder1,
+                text_encoder2,
+                hydit,
+                vae,
+                logit_scale,
+                ckpt_info,
+                hydit_version,
+            )
+        else:
+            os.makedirs(os.path.join(args.ip_adapter_state_path, "last"), exist_ok=True)
+            ipa_model.save_state_dict_to_folder(os.path.join(args.ip_adapter_state_path, "last"), acc_wrapped=False)
         logger.info("model saved.")
 
 
@@ -876,6 +904,17 @@ def setup_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="number of optimizers for fused backward pass and optimizer step / fused backward passとoptimizer stepのためのoptimizer数",
+    )
+    parser.add_argument(
+        "--train_ip_adapter",
+        action="store_true",
+        help="训练混元ipa，开启此选项后，按照ipa标准方法训练，其它层将被冻结",
+    )
+    parser.add_argument(
+        "--ip_adapter_state_path",
+        type=str,
+        default=None,
+        help="混元ipa的状态储存位置，请设置为一个文件夹，只有当train_ip_adapter为True时才生效",
     )
     return parser
 

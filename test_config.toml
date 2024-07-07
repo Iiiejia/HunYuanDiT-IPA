@@ -1,0 +1,12 @@
+[general]
+enable_bucket = true                        # 是否使用Aspect Ratio Bucketing
+# bucket_no_upscale = true
+[[datasets]]
+resolution = 1024                            # 训练分辨率
+batch_size = 4                              # 批次大小
+max_bucket_reso = 2048
+bucket_reso_steps = 64
+  [[datasets.subsets]]
+  image_dir = '/models/dataset/porcelain/images'                     # 指定包含训练图像的文件夹
+  class_tokens = 'a pictrue of porcelain. 一张瓷器的图片。'                # 指定标识符类
+  num_repeats = 1                          # 训练图像的重复次数
