@@ -483,6 +483,14 @@ masterpiece, best quality, 1boy, in business suit, standing at street, looking b
 
 
 ### About HunYuanDiT IPA
-The reference parameter settings are: accelerate launch hunyuan_train.py --train_ip_adapter --ip_adapter_state_path "/your/save/path"...... For using the IPA model, please refer to the method of 'hunyuan_test_ipa'.
+# Parameter Configuration
+To launch training with the IP Adapter, follow the configuration detailed below:
 
-Please note that you should replace "/your/save/path" with your actual save path.
+* accelerate launch hunyuan_train.py \
+* --train_ip_adapter \
+* --ip_adapter_state_path "/your/save/path" \
+* ...
+# Notes:
+Please ensure to replace "/your/save/path" with the actual path where you intend to save your model state.
+Using the IPA Model
+For utilizing the IPA (Instance-based Prompting Approach) model, kindly refer to the 'hunyuan_test_ipa.py'.
