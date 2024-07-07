@@ -480,3 +480,9 @@ masterpiece, best quality, 1boy, in business suit, standing at street, looking b
   * `--s` Specifies the number of steps in the generation.
 
   The prompt weighting such as `( )` and `[ ]` are working.
+
+
+### About HunYuanDiT IPA
+The reference parameter settings are: accelerate launch hunyuan_train.py --train_ip_adapter --ip_adapter_state_path "/your/save/path"...... For using the IPA model, please refer to the method of 'hunyuan_test_ipa'.
+
+Please note that you should replace "/your/save/path" with your actual save path.
