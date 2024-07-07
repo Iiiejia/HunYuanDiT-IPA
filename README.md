@@ -482,15 +482,15 @@ masterpiece, best quality, 1boy, in business suit, standing at street, looking b
   The prompt weighting such as `( )` and `[ ]` are working.
 
 
-### About HunYuanDiT IPA
-# Parameter Configuration
+# About HunYuanDiT IPA
+### Parameter Configuration
 To launch training with the IP Adapter, follow the configuration detailed below:
 
 * accelerate launch hunyuan_train.py \
 * --train_ip_adapter \
 * --ip_adapter_state_path "/your/save/path" \
 * ...
-# Notes:
+### Notes:
 Please ensure to replace "/your/save/path" with the actual path where you intend to save your model state.
 Using the IPA Model
 For utilizing the IPA (Instance-based Prompting Approach) model, kindly refer to the 'hunyuan_test_ipa.py'.
